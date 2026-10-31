@@ -242,3 +242,277 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.ResistorCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* ---------------------------------------------------------------------------
+   v2 additions: SMD codes, Ohm's law, LED resistor, loaded divider, divider
+   pair search, capacitor codes and unit helpers. Still pure functions.
+   --------------------------------------------------------------------------- */
+(function (root) {
+  'use strict';
+  var C = root.ResistorCore;
+
+  function fail(msg, extra) { var o = { ok: false, error: msg }; for (var k in extra) o[k] = extra[k]; return o; }
+  function clean(x, sig) { return Number(Number(x).toPrecision(sig || 12)); }
+  var SUP = { '-': '⁻', 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹' };
+  function pow10Text(e) { return '10' + String(e).split('').map(function (c) { return SUP[c]; }).join(''); }
+
+  /* All values of a series between lo and hi (inclusive), ascending */
+  function eValues(name, lo, hi) {
+    var base = C.SERIES[name], shift = name === 'E96' ? 2 : 1, out = [];
+    for (var d = Math.floor(Math.log10(lo)) - 1; d <= Math.floor(Math.log10(hi)) + 1; d++) {
+      for (var k = 0; k < base.length; k++) {
+        var v = Number(base[k] + 'e' + (d - shift));
+        if (v >= lo * (1 - 1e-9) && v <= hi * (1 + 1e-9)) out.push(v);
+      }
+    }
+    return out;
+  }
+
+  /* Smallest standard value at or above value */
+  function nextE(value, name) {
+    if (!(value > 0) || !isFinite(value)) return null;
+    var list = eValues(name, value / 10, value * 10);
+    for (var i = 0; i < list.length; i++) if (list[i] >= value * (1 - 1e-9)) return list[i];
+    return null;
+  }
+
+  /* ---------- SMD resistor codes ---------- */
+  var EIA_MULT = { Z: -3, Y: -2, R: -2, X: -1, S: -1, A: 0, B: 1, H: 1, C: 2, D: 3, E: 4, F: 5 };
+  var SMD_HELP = 'SMD codes are 3 digits (472), 4 digits (4702), R notation (4R7, R47) or EIA-96, two digits and a letter (01C).';
+
+  function decodeSMD(input) {
+    var raw = String(input == null ? '' : input).trim();
+    var s = raw.toUpperCase().replace(/\s+/g, '');
+    if (!s) return fail('Type the code printed on the part. ' + SMD_HELP);
+    var m;
+    if (/^0{1,4}$/.test(s)) return { ok: true, ohms: 0, format: 'jumper', label: 'Zero-ohm link', tol: null, working: s + ' marks a zero-ohm jumper link.' };
+    if ((m = /^(\d{2})(\d)$/.exec(s))) {
+      var e3 = Number(m[2]);
+      if (e3 > 7) return fail('A third digit of ' + e3 + ' would mean ×' + pow10Text(e3) + ', which is not used on resistors. Check the code, or try 4 digits.');
+      return { ok: true, ohms: Number(Number(m[1]) + 'e' + e3), format: '3-digit', label: '3-digit code', tol: 5,
+        sig: m[1], exp: e3, working: Number(m[1]) + ' × ' + pow10Text(e3) + ' Ω' };
+    }
+    if ((m = /^(\d{3})(\d)$/.exec(s))) {
+      var e4 = Number(m[2]);
+      if (e4 > 7) return fail('A last digit of ' + e4 + ' would mean ×' + pow10Text(e4) + ', which is not used on resistors. Check the code.');
+      return { ok: true, ohms: Number(Number(m[1]) + 'e' + e4), format: '4-digit', label: '4-digit code', tol: 1,
+        sig: m[1], exp: e4, working: Number(m[1]) + ' × ' + pow10Text(e4) + ' Ω' };
+    }
+    if ((m = /^(\d*)R(\d*)$/.exec(s)) && (m[1] + m[2]).length >= 1 && (m[1] + m[2]).length <= 4) {
+      var v = Number((m[1] || '0') + '.' + (m[2] || '0'));
+      var res = { ok: true, ohms: v, format: 'R', label: 'R notation', tol: (m[1] + m[2]).length >= 3 ? 1 : 5,
+        working: 'R marks the decimal point: ' + s + ' = ' + String(v) + ' Ω' };
+      if (/^\d{2}R$/.test(s)) {
+        var alt = decodeEIA(m[1], 'R');
+        if (alt.ok) res.alt = 'Read as EIA-96 it would be ' + C.formatOhms(alt.ohms) + '. R notation is far more common.';
+      }
+      return res;
+    }
+    if ((m = /^(\d{2})([A-Z])$/.exec(s))) {
+      if (!(m[2] in EIA_MULT)) return fail(m[2] + ' is not an EIA-96 multiplier letter. Use Z, Y/R, X/S, A, B/H, C, D, E or F, like 01C.');
+      return decodeEIA(m[1], m[2]);
+    }
+    if (/^\d{1,2}$/.test(s)) return fail('"' + raw + '" is too short. ' + SMD_HELP);
+    if (/^\d{5,}$/.test(s)) return fail('"' + raw + '" is too long. ' + SMD_HELP);
+    if (/R.*R/.test(s)) return fail('Use only one R. It stands in for the decimal point, like 4R7 for 4.7 Ω.');
+    return fail('Could not read "' + raw + '". ' + SMD_HELP);
+  }
+
+  function decodeEIA(dd, letter) {
+    var n = Number(dd);
+    if (n < 1 || n > 96) return fail('EIA-96 codes run from 01 to 96, then a letter. ' + dd + ' is out of range.');
+    var base = C.SERIES.E96[n - 1], e = EIA_MULT[letter];
+    var ohms = Number(base + 'e' + e);
+    return { ok: true, ohms: ohms, format: 'EIA-96', label: 'EIA-96 code', tol: 1, sig: String(base), exp: e,
+      working: dd + ' is E96 value ' + base + ', ' + letter + ' means ×' + pow10Text(e) + ': ' + base + ' × ' + pow10Text(e) + ' Ω' };
+  }
+
+  function rNotation(v) { return String(clean(v, 6)).replace(/^0\./, 'R').replace('.', 'R').replace(/^(\d+)$/, '$1R0'); }
+
+  /* Equivalent markings for a value in every format */
+  function encodeSMD(value) {
+    var out = { three: null, four: null, eia: null };
+    if (!(value > 0)) return out;
+    var e2 = C.encode(value, 2);
+    if (e2.ok) out.three = e2.mult >= 0 && e2.mult <= 7 ? e2.digits.join('') + e2.mult : (value < 10 ? rNotation(value) : null);
+    var e3 = C.encode(value, 3);
+    if (e3.ok) out.four = e3.mult >= 0 && e3.mult <= 7 ? e3.digits.join('') + e3.mult : (value < 100 ? rNotation(value) : null);
+    if (e3.ok) {
+      var mant = Number(e3.digits.join(''));
+      var idx = C.SERIES.E96.indexOf(mant);
+      if (idx >= 0) {
+        var exp = e3.mult;
+        // E96 mantissa is 100..976, so value = mant × 10^exp
+        var letter = { '-3': 'Z', '-2': 'Y', '-1': 'X', 0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E', 5: 'F' }[exp];
+        if (letter) out.eia = (idx + 1 < 10 ? '0' : '') + (idx + 1) + letter;
+      }
+    }
+    return out;
+  }
+
+  /* ---------- Ohm's law ---------- */
+  var OHM_PAIRS = {
+    VI: { R: 'V/I', P: 'VI' }, VR: { I: 'V/R', P: 'V2/R' }, VP: { I: 'P/V', R: 'V2/P' },
+    IR: { V: 'IR', P: 'I2R' }, IP: { V: 'P/I', R: 'P/I2' }, RP: { V: 'sqrt(PR)', I: 'sqrt(P/R)' }
+  };
+  var NAMES = { V: 'Voltage', I: 'Current', R: 'Resistance', P: 'Power' };
+  function ohmsLaw(given) {
+    var keys = ['V', 'I', 'R', 'P'].filter(function (k) { return given[k] != null; });
+    if (keys.length !== 2) return fail('Enter exactly two of voltage, current, resistance and power.');
+    for (var i = 0; i < 2; i++) {
+      var x = given[keys[i]];
+      if (!isFinite(x) || x <= 0) return fail(NAMES[keys[i]] + ' must be a number above zero.', { field: keys[i] });
+    }
+    var V = given.V, I = given.I, R = given.R, P = given.P, pair = keys.join('');
+    switch (pair) {
+      case 'VI': R = V / I; P = V * I; break;
+      case 'VR': I = V / R; P = V * V / R; break;
+      case 'VP': I = P / V; R = V * V / P; break;
+      case 'IR': V = I * R; P = I * I * R; break;
+      case 'IP': V = P / I; R = P / (I * I); break;
+      case 'RP': V = Math.sqrt(P * R); I = Math.sqrt(P / R); break;
+    }
+    return { ok: true, V: clean(V), I: clean(I), R: clean(R), P: clean(P), pair: pair, formulas: OHM_PAIRS[pair] };
+  }
+
+  /* ---------- LED series resistor ---------- */
+  var RATINGS = [[0.125, '1/8 W'], [0.25, '1/4 W'], [0.5, '1/2 W'], [1, '1 W'], [2, '2 W'], [5, '5 W']];
+  function ratingFor(power) {
+    var need = power * 2;
+    for (var i = 0; i < RATINGS.length; i++) if (RATINGS[i][0] >= need * (1 - 1e-9)) return { watts: RATINGS[i][0], label: RATINGS[i][1], need: need };
+    return { watts: null, label: 'Over 5 W', need: need };
+  }
+  function ledResistor(o) {
+    var vs = o.vs, vf = o.vf, ma = o.ma, n = o.n;
+    if (!(vs > 0)) return fail('Enter the supply voltage, like 5 or 12.', { field: 'vs' });
+    if (!(vf > 0)) return fail('Enter the LED forward voltage, like 2.0.', { field: 'vf' });
+    if (!(ma > 0)) return fail('Enter the LED current in mA. 20 mA suits most 5 mm LEDs; 2 to 10 mA is plenty for indicators.', { field: 'ma' });
+    if (!(n >= 1) || Math.floor(n) !== n) return fail('Use a whole number of LEDs, 1 or more.', { field: 'n' });
+    var drop = clean(vs - n * vf);
+    if (drop <= 0) return fail('The supply is too low. ' + n + ' LED' + (n > 1 ? 's' : '') + ' at ' + vf + ' V need more than ' + clean(n * vf, 6) + ' V, before the resistor has anything left to drop.', { tooLow: true, need: clean(n * vf, 6), field: 'vs' });
+    var I = ma / 1000, exact = clean(drop / I);
+    function opt(series) {
+      var r = nextE(exact, series), cur = drop / r, p = drop * cur;
+      return { series: series, ohms: r, current: clean(cur), power: clean(p), rating: ratingFor(p) };
+    }
+    return { ok: true, drop: drop, exact: exact, current: I, power: clean(drop * I), e12: opt('E12'), e24: opt('E24'), lowHeadroom: drop < 0.5 };
+  }
+
+  /* ---------- Divider with load, and E-series pair search ---------- */
+  function loadedDivider(vin, r1, r2, rl) {
+    var base = C.divider(vin, r1, r2);
+    if (!base) return null;
+    var out = { vout: base.vout, current: base.current, ratio: base.ratio, p1: Math.pow(base.current, 2) * r1, p2: Math.pow(base.current, 2) * r2 };
+    if (rl > 0) {
+      var r2l = C.parallelR([r2, rl]);
+      var vl = vin * r2l / (r1 + r2l);
+      out.loaded = { r2eff: r2l, vout: vl, drop: (base.vout - vl) / base.vout * 100, load: vl / rl, current: vin / (r1 + r2l) };
+    }
+    return out;
+  }
+
+  function bestDividerPair(vin, vout, series, count) {
+    if (!(vin > 0)) return fail('Enter Vin above 0 V.', { field: 'vin' });
+    if (!(vout > 0) || !(vout < vin)) return fail('Target Vout must be above 0 V and below Vin (' + vin + ' V).', { field: 'vout' });
+    var k = vout / vin, r2s = eValues(series, 1000, 99999), all = [];
+    r2s.forEach(function (r2) {
+      var ideal = r2 * (1 / k - 1);
+      var r1 = C.nearestE(ideal, series).value;
+      [r1, nextE(ideal, series)].forEach(function (a) {
+        var v = vin * r2 / (a + r2);
+        all.push({ r1: a, r2: r2, vout: clean(v), error: clean((v - vout) / vout * 100, 6) });
+      });
+    });
+    all.sort(function (a, b) {
+      var d = Math.abs(a.error) - Math.abs(b.error);
+      if (Math.abs(d) > 1e-9) return d;
+      return Math.abs(Math.log(a.r2 / 1e4)) - Math.abs(Math.log(b.r2 / 1e4));
+    });
+    var seen = {}, top = [];
+    for (var i = 0; i < all.length && top.length < (count || 3); i++) {
+      var key = (all[i].r1 / all[i].r2).toPrecision(8);
+      if (!seen[key]) { seen[key] = 1; top.push(all[i]); }
+    }
+    return { ok: true, best: top[0], options: top, idealRatio: clean(1 / k - 1) };
+  }
+
+  /* ---------- Capacitor codes (values in pF) ---------- */
+  var CAP_TOL = { B: '±0.1 pF', C: '±0.25 pF', D: '±0.5 pF', F: '±1%', G: '±2%', J: '±5%', K: '±10%', M: '±20%', Z: '+80% / −20%' };
+  var CAP_HELP = 'Ceramic caps use 3 digits in picofarads (104 = 100 nF), optionally followed by a tolerance letter (J, K or M).';
+  function decodeCap(input) {
+    var raw = String(input == null ? '' : input).trim();
+    var s = raw.toUpperCase().replace(/\s+/g, '').replace(/PF$/, '');
+    if (!s) return fail('Type the code on the capacitor. ' + CAP_HELP);
+    var tol = null, m = /^(.*?)([BCDFGJKMZ])$/.exec(s);
+    if (m && m[1] && !/R$/.test(m[1])) { tol = { letter: m[2], text: CAP_TOL[m[2]] }; s = m[1]; }
+    var pf, working;
+    if ((m = /^(\d{2})(\d)$/.exec(s))) {
+      var d = Number(m[2]);
+      if (d === 7) return fail('7 is not used as a capacitor multiplier digit. Check the code. ' + CAP_HELP);
+      var e = d === 8 ? -2 : d === 9 ? -1 : d;
+      pf = Number(Number(m[1]) + 'e' + e);
+      working = Number(m[1]) + ' × ' + pow10Text(e) + ' pF';
+    } else if ((m = /^(\d{1,2})$/.exec(s))) {
+      pf = Number(m[1]); working = 'One or two digits are the value itself: ' + pf + ' pF';
+    } else if ((m = /^(\d*)R(\d+)$/.exec(s)) && (m[1] + m[2]).length <= 3) {
+      pf = Number((m[1] || '0') + '.' + m[2]); working = 'R marks the decimal point: ' + pf + ' pF';
+    } else if (/^\d{4,}$/.test(s)) {
+      return fail('"' + raw + '" has too many digits. ' + CAP_HELP);
+    } else {
+      return fail('Could not read "' + raw + '". ' + CAP_HELP);
+    }
+    return { ok: true, pf: clean(pf), tol: tol, working: working };
+  }
+
+  /* "100n", "4n7", "0.1u", "4.7 nF", "100 pF", "1µ" -> pF */
+  var CAP_EXP = { P: 0, N: 3, U: 6, 'µ': 6, 'μ': 6, M: 9 };
+  function parseCap(input) {
+    var raw = String(input == null ? '' : input).trim();
+    var s = raw.replace(/\s+/g, '').replace(/f(arads?)?$/i, '');
+    if (!s) return fail('Type a capacitance, like 100n, 4n7 or 0.1u.');
+    var m;
+    function ex(u) { if (!u) return 0; var up = u.toUpperCase(); return CAP_EXP[up] != null ? CAP_EXP[up] : CAP_EXP[u]; }
+    if ((m = /^(\d+)([pnuµμ])(\d+)$/i.exec(s))) return { ok: true, pf: clean(Number(m[1] + '.' + m[3]) * Math.pow(10, ex(m[2]))) };
+    if ((m = /^(\d+\.?\d*|\.\d+)([pnuµμ])?$/i.exec(s))) return { ok: true, pf: clean(Number(m[1]) * Math.pow(10, ex(m[2]))) };
+    return fail('Could not read "' + raw + '". Use a number and p, n or u, like 100n, 4n7 or 0.1u.');
+  }
+
+  function encodeCap(pf, tolLetter) {
+    if (!(pf > 0)) return fail('Enter a capacitance above zero.');
+    var suffix = tolLetter && CAP_TOL[tolLetter] ? tolLetter : '';
+    if (pf < 10) {
+      var enc0 = C.encode(pf, 2);
+      if (!enc0.ok) return fail('Values under 10 pF need two significant figures at most, like 4.7 pF.');
+      return { ok: true, code: rNotation(pf) + suffix, working: 'Under 10 pF, R marks the decimal point.' };
+    }
+    var enc = C.encode(pf, 2);
+    if (!enc.ok || enc.mult < 0) {
+      var r = C.nearestE(pf, 'E12').value;
+      return fail(formatCap(pf).primary + ' needs more than two significant figures, and codes only have two. The nearest E12 value is ' + formatCap(r).primary + '.', { suggest: r });
+    }
+    if (enc.mult > 6) return fail('That is too large for a 3-digit code. Codes go up to 99 × 10⁶ pF (99 µF).');
+    var dd = enc.digits.join('');
+    return { ok: true, code: dd + enc.mult + suffix, working: Number(dd) + ' × ' + pow10Text(enc.mult) + ' pF' };
+  }
+
+  function trimN(x, sig) { return String(parseFloat(Number(x).toPrecision(sig || 4))); }
+  function group(x) {
+    var s = trimN(x, 6), p = s.split('.');
+    p[0] = p[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return p.join('.');
+  }
+  function formatCap(pf) {
+    var all = { pF: group(pf) + ' pF', nF: group(pf / 1e3) + ' nF', 'µF': group(pf / 1e6) + ' µF' };
+    var primary = pf < 1000 ? trimN(pf) + ' pF' : pf < 1e6 ? trimN(pf / 1e3) + ' nF' : trimN(pf / 1e6) + ' µF';
+    return { primary: primary, all: all };
+  }
+
+  var ext = {
+    eValues: eValues, nextE: nextE, decodeSMD: decodeSMD, encodeSMD: encodeSMD, EIA_MULT: EIA_MULT,
+    ohmsLaw: ohmsLaw, ledResistor: ledResistor, ratingFor: ratingFor, RATINGS: RATINGS,
+    loadedDivider: loadedDivider, bestDividerPair: bestDividerPair,
+    decodeCap: decodeCap, encodeCap: encodeCap, parseCap: parseCap, formatCap: formatCap, CAP_TOL: CAP_TOL,
+    pow10Text: pow10Text, trimN: trimN
+  };
+  for (var k in ext) C[k] = ext[k];
+})(typeof window !== 'undefined' ? window : globalThis);
